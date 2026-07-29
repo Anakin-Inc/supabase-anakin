@@ -6284,7 +6284,7 @@ mod _rt {
 /// ```
 #[allow(unused_macros)]
 #[doc(hidden)]
-macro_rules! __export_anakin_search_impl {
+macro_rules! __export_anakin_impl {
     ($ty:ident) => {
         self::export!($ty with_types_in self);
     };
@@ -6295,15 +6295,15 @@ macro_rules! __export_anakin_search_impl {
     };
 }
 #[doc(inline)]
-pub(crate) use __export_anakin_search_impl as export;
+pub(crate) use __export_anakin_impl as export;
 #[cfg(target_arch = "wasm32")]
 #[unsafe(
-    link_section = "component-type:wit-bindgen:0.41.0:anakin:search-fdw@0.1.0:anakin-search:encoded world"
+    link_section = "component-type:wit-bindgen:0.41.0:anakin:anakin-fdw@0.2.0:anakin:encoded world"
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 4078] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xea\x1e\x01A\x02\x01\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 4064] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xe3\x1e\x01A\x02\x01\
 A\x14\x01B\x16\x01o\x02ss\x01p\0\x04\0\x07headers\x03\0\x01\x01q\x05\x03get\0\0\x04\
 post\0\0\x03put\0\0\x05patch\0\0\x06delete\0\0\x04\0\x06method\x03\0\x03\x01r\x04\
 \x06method\x04\x03urls\x07headers\x02\x04bodys\x04\0\x07request\x03\0\x05\x01r\x04\
@@ -6390,10 +6390,9 @@ j\x01\x10\x01\x09\x01@\x02\x03ctx\x0d\x03row\x0f\0\x11\x04\0\x09iter-scan\x01\x1
 \x05rowid\x01\x07new-row\x0f\0\x0b\x04\0\x06update\x01\x14\x01@\x02\x03ctx\x0d\x05\
 rowid\x01\0\x0b\x04\0\x06delete\x01\x15\x04\0\x0aend-modify\x01\x0e\x01ps\x01j\x01\
 \x16\x01\x09\x01@\x02\x03ctx\x0d\x04stmt\x05\0\x17\x04\0\x15import-foreign-schem\
-a\x01\x18\x04\0\x20supabase:wrappers/routines@0.2.0\x05\x0c\x04\0%anakin:search-\
-fdw/anakin-search@0.1.0\x04\0\x0b\x13\x01\0\x0danakin-search\x03\0\0\0G\x09produ\
-cers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x06\
-0.41.0";
+a\x01\x18\x04\0\x20supabase:wrappers/routines@0.2.0\x05\x0c\x04\0\x1eanakin:anak\
+in-fdw/anakin@0.2.0\x04\0\x0b\x0c\x01\0\x06anakin\x03\0\0\0G\x09producers\x01\x0c\
+processed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x060.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

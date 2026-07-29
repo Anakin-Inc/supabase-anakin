@@ -4,6 +4,90 @@ This was previously flagged and deliberately deferred as "unfamiliar stack,
 real risk of a shallow/wrong attempt." Built now, with the real interface
 confirmed from source before writing any Rust — not guessed.
 
+## Update — 2026-07-29: three more sync-only tables added (v0.1.0 → v0.2.0)
+
+The original `v0.1.0` build (below) deliberately scoped this FDW to
+`anakin_search` only, since every other Anakin endpoint known at the time was
+submit-then-poll and `routines.wit` has no async primitive a foreign-table
+scan can represent. Re-examined against that exact constraint: are there
+*any other* Anakin endpoints that are synchronous end-to-end, the same way
+`POST /search` is?
+
+Checked `anakin-mcp/src/tools/wire.ts` and `ai-visibility.ts` directly (not
+assumed) for every tool's handler:
+
+- `wire_catalog` → `client.wireCatalog(slug)` → a single `GET /wire/catalog`
+  or `GET /wire/catalog/{slug}` call, no polling.
+- `wire_discover` → `client.wireResolve(q, limit)` → a single
+  `GET /wire/resolve` call, no polling.
+- `ai_visibility_sources` → `client.aiVisibilitySources()` → a single
+  `GET /ai-visibility/sources` call, no polling.
+- Confirmed NOT sync-only (so still out of scope): `wire_read_action` /
+  `wire_write_action` (`POST /wire/task` + poll `GET /wire/jobs/{id}` via
+  `runWireAction`/`pollWireJob`), `ai_visibility_search` (`POST
+  /ai-visibility/search` + poll), `wire_login`, `wire_build` — all read
+  through `client.ts` line by line to confirm the poll loop is real, not
+  assumed from the tool name.
+
+That's three genuinely synchronous read endpoints, so three more foreign
+tables were added: `anakin_wire_catalog`, `anakin_wire_discover`,
+`anakin_ai_visibility_sources`. The mechanism that makes one Wasm component
+able to back four foreign tables — table-level `object` option dispatch via
+`ctx.get_options(&OptionsType::Table).require("object")` in `begin_scan` /
+`begin_modify` — is not invented here: it's the exact pattern the *real*,
+currently-shipping `paddle_fdw` and `shopify_fdw` in
+`supabase/wrappers/wasm-wrappers/fdw/` use for their own multi-object
+wrappers. `paddle_fdw/src/lib.rs` was fetched and read in full
+(`gh api repos/supabase/wrappers/contents/wasm-wrappers/fdw/paddle_fdw/src/lib.rs`)
+to confirm this before writing any dispatch code — `routines.wit`'s
+`Context` resource has no local-foreign-table-name accessor, only
+`get-options`, so `object` genuinely is the only thing a Guest impl can
+switch on; this was verified, not assumed to be possible.
+
+**Response shapes were pinned from real sources, not guessed:**
+
+- `anakin_wire_catalog` / `anakin_wire_discover`: `anakin-mcp/openapi.yaml`
+  ("Anakin Wire API") has full schemas for `/catalog` (`CatalogEntry`) and
+  `/resolve` (`ResolveResult`) — used verbatim, field-for-field, the same
+  rigor the original `SearchResult`/`SearchResultItem` mapping used against
+  `anakin-py`'s Pydantic models.
+- `GET /wire/catalog/{slug}` (per-catalog action detail) was deliberately
+  **not** added as a table: its response (`{ catalog, actions,
+  login_input_schema }`) is a compound object, not a homogeneous list like
+  `GET /wire/catalog`'s no-slug mode, so it doesn't decompose into one
+  table's column set without inventing a shape the API doesn't return. Only
+  the list mode (`GET /wire/catalog`, no slug) is exposed.
+- `anakin_ai_visibility_sources`: no OpenAPI schema exists for this endpoint
+  anywhere in this codebase. `anakin-tap-anakin/tap_anakin/streams.py`'s
+  `AiVisibilitySourcesStream` is the only other place in this codebase that
+  has already modeled this response — its own module docstring says field
+  names not independently confirmed against a live response get a `raw`
+  passthrough alongside best-effort typed fields, rather than a guessed hard
+  schema. This FDW's `anakin_ai_visibility_sources` table (`slug`, `label`,
+  `raw`) carries that exact same honesty forward instead of inventing false
+  certainty: `slug` falls back to `id`, `label` falls back to `name`, and
+  `raw` is the full source object verbatim so nothing is lost if the
+  best-effort names are wrong.
+
+**Nested/variable fields are `json` columns, not flattened guesses.**
+`ResolveResult.params` (`{ required: [...], optional: [...] }`) and
+`CatalogEntry.auth_types`/`supported_sources` (string arrays) are exposed as
+`json` cells (`Cell::Json`, WIT's `json(string)` variant) rather than invented
+flat columns — Postgres gets them as `jsonb`.
+
+**Compile re-verified after the change** — see the fresh log at the bottom of
+"Compile-check status" below; same toolchain pin (`cargo-component 0.21.1`,
+`rustc 1.95.0`, `wasm32-unknown-unknown`) as the original `v0.1.0` build, no
+new dependencies, no `#[allow(warnings)]` added outside the pre-existing
+`mod bindings` line.
+
+The WIT component package was renamed `anakin:search-fdw@0.1.0` →
+`anakin:anakin-fdw@0.2.0` (and the Rust struct `AnakinSearchFdw` →
+`AnakinFdw`) since "search" is no longer an accurate name for a four-table
+wrapper — safe to rename now because, per "Not done" below, no
+`v0.1.0` tag/release had actually been cut yet (nothing external references
+the old package name).
+
 ## What was confirmed, from where
 
 All pulled live via `gh api` / `curl` against `raw.githubusercontent.com`,
@@ -85,12 +169,17 @@ not assumed or reconstructed from memory:
 
 ## What's here
 
+*(As of the original `v0.1.0` build — search-only. See the
+"Update — 2026-07-29" section at the top of this file for the current
+`v0.2.0` four-table state; the layout below is otherwise unchanged.)*
+
 ```
 Cargo.toml                    crate-type=["cdylib"], package.metadata.component
                                pointing at ./wit and ./supabase-wrappers-wit
 .cargo/config.toml             target = "wasm32-unknown-unknown"
 wit/world.wit                  anakin:search-fdw@0.1.0, imports host
                                 interfaces, exports routines@0.2.0
+                                (now anakin:anakin-fdw@0.2.0 — see update)
 supabase-wrappers-wit/         http.wit, jwt.wit, routines.wit, stats.wit,
                                 time.wit, types.wit, utils.wit, world.wit —
                                 downloaded verbatim from
@@ -98,17 +187,19 @@ supabase-wrappers-wit/         http.wit, jwt.wit, routines.wit, stats.wit,
                                 byte-for-byte, not retyped by hand
 src/lib.rs                     AnakinSearchFdw: implements all 12 Guest
                                 methods against POST /search
+                                (now AnakinFdw, 4 tables — see update)
 README.md, SUBMIT.md
 ```
 
-`AnakinSearchFdw` exposes one foreign table, `anakin_search`, parameterized
+`AnakinSearchFdw` exposed one foreign table, `anakin_search`, parameterized
 by a required `prompt =` qual (POST /search has no "list all" mode — same
 reason `orb_fdw` requires certain quals to address specific endpoints).
 `limit` pushes down to the API's `limit` body param (default 5, matching
 `anakin-py`'s own default); `offset` is left to Postgres, same as every
 other Wasm FDW that only gets the combined bound from `ctx.get_limit()`.
 `begin_modify` returns an explicit "read-only" error — search results are
-not writable back to the API.
+not writable back to the API. (`AnakinFdw` now implements the same shape for
+three more tables — see the update section.)
 
 ## Verified, not assumed
 
@@ -227,6 +318,35 @@ turned out to be correct: every signature it flagged as matching did in fact
 compile against the real generated bindings without modification. It's kept
 below as evidence of how the implementation was derived, not as a fallback.
 
+### Re-verified after the 2026-07-29 four-table change
+
+Same command, same toolchain pin, rerun from a clean
+`target/wasm32-unknown-unknown/release/` after adding `anakin_wire_catalog`,
+`anakin_wire_discover`, `anakin_ai_visibility_sources` and the `object`-based
+dispatch:
+
+```
+$ cargo component build --release --target wasm32-unknown-unknown
+  Generating bindings for anakin_fdw (src/bindings.rs)
+   Compiling zmij v1.0.23
+   Compiling serde_core v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling wit-bindgen-rt v0.41.0
+   Compiling anakin_fdw v0.2.0 (.../supabase-anakin)
+    Finished `release` profile [optimized] target(s) in 4.61s
+    Creating component target/wasm32-unknown-unknown/release/anakin_fdw.wasm
+```
+
+Zero warnings, zero errors. `cargo component check` (dev profile) also passes
+clean. Header bytes re-confirmed as a genuine Component Model binary:
+`00 61 73 6d 0d 00 01 00`. The `wit-bindgen`-embedded custom section now
+reads `component-type:wit-bindgen:0.41.0:anakin:anakin-fdw@0.2.0:anakin:encoded world`
+(package/world renamed from `anakin:search-fdw@0.1.0`/`anakin-search`, per the
+update note at the top of this file). SHA-256 of this local build artifact:
+`e11bf19d04c95b577fcb2ae5d8e52ac3bb438df60e8dbf8f72bd26981f70f5f5` — again,
+evidence of a completed local build, not the checksum for a real
+`fdw_package_checksum` (that comes from CI's release artifact).
+
 ## Not done / real effort remaining for a human
 
 - **`src/bindings.rs` is a build artifact, checked in only as evidence.**
@@ -245,10 +365,15 @@ below as evidence of how the implementation was derived, not as a fallback.
   from the real `orb.md`/`create-wasm-wrapper.md` catalog docs and adapted,
   not tested. Compiling cleanly and producing a valid Component Model
   binary is strong evidence the Rust/WIT surface is right, but it does not
-  prove the `POST /search` request/response handling is correct against the
-  live API — that needs a real Anakin API key and a real HTTP round trip,
-  which this sandbox cannot do (no Postgres + Wrappers host to invoke the
-  guest's `http` import from).
+  prove the `POST /search`, `GET /wire/catalog`, `GET /wire/resolve`, or
+  `GET /ai-visibility/sources` request/response handling is correct against
+  the live API — that needs a real Anakin API key and a real HTTP round
+  trip per table, which this sandbox cannot do (no Postgres + Wrappers host
+  to invoke the guest's `http` import from). This is the biggest remaining
+  risk for the three new tables specifically: their column mappings are
+  grounded in `openapi.yaml` / the sibling `anakin-tap-anakin` precedent, not
+  in a captured real response body, unlike `anakin_search`'s mapping (which
+  was cross-checked against `anakin-py`'s Pydantic models field-for-field).
 - **No release pipeline was created.** A real submission needs its own
   GitHub repo (fork of `postgres-wasm-fdw` or built fresh, as done here),
   a `.github/workflows/release_wasm_fdw.yml` copied from the template
@@ -269,23 +394,24 @@ The Rust/Wasm side is done and compiles clean. What's left is entirely
 release-infrastructure and live-integration work that needs credentials and
 hosting this sandbox doesn't have:
 
-1. Create (or fork `supabase-community/postgres-wasm-fdw` and replace) a
-   `supabase-anakin` GitHub repo from this directory.
+1. ~~Create a `supabase-anakin` GitHub repo~~ — done:
+   `github.com/Anakin-Inc/supabase-anakin`, pushed to `main`.
 2. Add `.github/workflows/release_wasm_fdw.yml` (copy from
-   `postgres-wasm-fdw`), pinning `cargo-component` to **0.21.1 or newer**
-   (not whatever the template currently pins — check it; the template may
-   still reference a version too old to know the `wasm32-wasip1` target
-   name, the exact failure mode hit and fixed in this sandbox).
-3. `git tag v0.1.0 && git push origin v0.1.0` — triggers the build, produces
+   `supabase-community/postgres-wasm-fdw`), pinning `cargo-component` to
+   **0.21.1 or newer** (not whatever the template currently pins — check it;
+   the template may still reference a version too old to know the
+   `wasm32-wasip1` target name, the exact failure mode hit and fixed in this
+   sandbox). Not yet added.
+3. `git tag v0.2.0 && git push origin v0.2.0` — triggers the build, produces
    `anakin_fdw.wasm` + checksum as a GitHub release. (This sandbox's local
-   build already proves the same source compiles clean; the CI run's
-   checksum is what actually goes in the install SQL, since it's the
-   artifact that gets hosted and downloaded.)
+   build already proves the same source compiles clean, including after the
+   four-table change; the CI run's checksum is what actually goes in the
+   install SQL, since it's the artifact that gets hosted and downloaded.)
 4. Fill the `fdw_package_checksum` into `README.md`'s install SQL from the
    release output.
 5. Smoke-test against a real Supabase/Postgres instance with the Wrappers
    extension and a real Anakin API key before calling this "done" in
-   production terms — `select * from anakin_search where prompt = '...'`
-   round-tripping through a real `POST /search` call is the one thing that
-   was not and could not be verified here (no Postgres, no live API key in
-   this sandbox).
+   production terms — `select` round-tripping through a real `POST /search`,
+   `GET /wire/catalog`, `GET /wire/resolve`, and `GET /ai-visibility/sources`
+   call against all four tables is what was not and could not be verified
+   here (no Postgres, no live API key in this sandbox).
