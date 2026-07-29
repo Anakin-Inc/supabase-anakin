@@ -1,6 +1,6 @@
-package anakin:search-fdw@0.1.0;
+package anakin:anakin-fdw@0.2.0;
 
-world anakin-search {
+world anakin {
     import supabase:wrappers/http@0.2.0;
     import supabase:wrappers/jwt@0.2.0;
     import supabase:wrappers/stats@0.2.0;
