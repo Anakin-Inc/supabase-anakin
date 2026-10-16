@@ -1,6 +1,6 @@
 #[allow(warnings)]
 mod bindings;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 use bindings::{
     exports::supabase::wrappers::routines::Guest,
@@ -8,13 +8,13 @@ use bindings::{
         http, stats, time,
         types::{
             Cell, Column, Context, FdwError, FdwResult, ImportForeignSchemaStmt, ImportSchemaType,
-            OptionsType, Row, Value,
+            OptionsType, Row, TypeOid, Value,
         },
         utils,
     },
 };
 
-// This FDW backs FOUR foreign tables from one Wasm component, dispatched by
+// This FDW backs SIX foreign tables from one Wasm component, dispatched by
 // the table-level `object` option (read via `ctx.get_options(&OptionsType::Table)`
 // in begin_scan/begin_modify) - the same multi-object mechanism the real
 // `paddle_fdw` and `shopify_fdw` in supabase/wrappers use (confirmed by
@@ -28,8 +28,8 @@ use bindings::{
 struct AnakinFdw {
     base_url: String,
     headers: Vec<(String, String)>,
-    // which foreign table is being scanned: "search" | "wire_catalog" |
-    // "wire_discover" | "ai_visibility_sources" - set from the table's
+    // which foreign table is being scanned: "scrape" | "map" | "search" |
+    // "wire_catalog" | "wire_discover" | "ai_visibility_sources" - set from the table's
     // `object` option at the start of every scan/modify.
     object: String,
     // the `where prompt = '...'` qual for anakin_search, echoed back per row
@@ -38,12 +38,12 @@ struct AnakinFdw {
     search_id: String,
     // the `where q = '...'` qual for anakin_wire_discover, echoed back per row
     q: String,
-    // buffered result items from the single synchronous request for the
-    // current scan - every one of these four endpoints is a plain GET/POST
-    // with no job id and no pagination cursor Wrappers could follow, so (as
-    // with the original anakin_search) one call fills this buffer once
+    // buffered result rows for the current scan - every object fills this
+    // buffer once in begin_scan (there is no pagination cursor to follow)
     src_rows: Vec<JsonValue>,
     src_idx: usize,
+    // how long to poll async jobs (map, and scrapes that outlive the inline wait)
+    poll_timeout_secs: i64,
 }
 
 // pointer for the static FDW instance
@@ -57,6 +57,10 @@ static FDW_NAME: &str = "AnakinFdw";
 // anakin_wire_discover reuses the same constant rather than inventing a
 // second one.
 static DEFAULT_LIMIT: i64 = 5;
+
+static USER_AGENT: &str = concat!("supabase-anakin-fdw/", env!("CARGO_PKG_VERSION"));
+const POLL_INTERVAL_MS: u64 = 2_000;
+const DEFAULT_POLL_TIMEOUT_SECS: i64 = 180;
 
 impl AnakinFdw {
     fn init_instance() {
@@ -263,8 +267,173 @@ impl AnakinFdw {
         Ok(())
     }
 
+    fn do_post(&self, path: &str, body: &JsonValue) -> Result<JsonValue, FdwError> {
+        let req = http::Request {
+            method: http::Method::Post,
+            url: format!("{}{}", self.base_url, path),
+            headers: self.headers.clone(),
+            body: body.to_string(),
+        };
+        let resp = http::post(&req)?;
+        http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
+        stats::inc_stats(FDW_NAME, stats::Metric::BytesIn, resp.body.len() as i64);
+        serde_json::from_str(&resp.body).map_err(|e| e.to_string())
+    }
+
+    // GET `path` until the job reaches a terminal status or poll_timeout_secs
+    // runs out. The host's `time::sleep` blocks the backend between polls, so
+    // a slow job holds the query open (it can be cancelled like any query).
+    fn poll_job(&self, path: &str, mut body: JsonValue) -> Result<JsonValue, FdwError> {
+        let deadline = time::epoch_secs() + self.poll_timeout_secs;
+        loop {
+            if let Some("completed" | "failed") = body.get("status").and_then(|v| v.as_str()) {
+                return Ok(body);
+            }
+            if time::epoch_secs() >= deadline {
+                let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                return Err(format!(
+                    "Anakin job {id} did not finish within {}s (raise the \
+                     poll_timeout_secs server option)",
+                    self.poll_timeout_secs
+                ));
+            }
+            time::sleep(POLL_INTERVAL_MS);
+            body = self.do_get(&format!("{}{}", self.base_url, path))?;
+        }
+    }
+
+    // POST /url-scraper/scrape blocks up to ~90s and returns the finished
+    // page; if the page takes longer it returns the job id and a pending
+    // status, and we poll GET /url-scraper/{id}. Works without an API key on
+    // the keyless free tier. One row per URL in `where url = ...` / `url in
+    // (...)`; `country` and `use_browser` filters are passed through.
+    fn fetch_scrape_results(&mut self, ctx: &Context) -> FdwResult {
+        let opts = ctx.get_options(&OptionsType::Table);
+        let formats: Vec<String> = opts
+            .require_or("formats", "markdown")
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut country = opts.get("country");
+        let mut use_browser = opts.get("use_browser").as_deref().and_then(parse_bool);
+        let mut urls = Vec::new();
+        for qual in ctx.get_quals() {
+            if qual.operator() != "=" {
+                continue;
+            }
+            match (qual.field().as_str(), qual.value()) {
+                ("url", value) => urls = qual_strings(&value),
+                ("country", Value::Cell(Cell::String(s))) => country = Some(s),
+                ("use_browser", Value::Cell(Cell::Bool(b))) => use_browser = Some(b),
+                _ => {}
+            }
+        }
+        if urls.is_empty() {
+            return Err(
+                "anakin_scrape requires an equality predicate on 'url', e.g. \
+                        select * from anakin_scrape where url = 'https://example.com' \
+                        (or url in (...))"
+                    .to_owned(),
+            );
+        }
+
+        self.src_rows.clear();
+        for url in urls {
+            let mut req = json!({ "url": url, "formats": formats });
+            if let Some(country) = &country {
+                req["country"] = json!(country);
+            }
+            if let Some(use_browser) = use_browser {
+                req["useBrowser"] = json!(use_browser);
+            }
+            let mut resp = self.do_post("/url-scraper/scrape", &req)?;
+            let job_id = resp
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+            if let Some(id) = job_id {
+                resp = self.poll_job(&format!("/url-scraper/{id}"), resp)?;
+            }
+
+            let mut row = snake_case_keys(&resp);
+            // echo the filter values so Postgres' local recheck of the WHERE
+            // clause keeps the row (the API reports final_url separately)
+            row.insert("url".to_owned(), json!(url));
+            if let Some(country) = &country {
+                row.insert("country".to_owned(), json!(country));
+            }
+            row.insert(
+                "use_browser".to_owned(),
+                json!(use_browser.unwrap_or(false)),
+            );
+            row.insert("attrs".to_owned(), resp);
+            self.src_rows.push(JsonValue::Object(row));
+        }
+        self.src_idx = 0;
+
+        stats::inc_stats(FDW_NAME, stats::Metric::RowsIn, self.src_rows.len() as i64);
+        Ok(())
+    }
+
+    // POST /map submits a job, GET /map/{id} returns `links` and
+    // `externalLinks` once completed. One row per discovered URL.
+    fn fetch_map_results(&mut self, ctx: &Context) -> FdwResult {
+        let url = Self::require_eq_qual(ctx, "url", "anakin_map")?;
+        let opts = ctx.get_options(&OptionsType::Table);
+        let mut req = json!({ "url": url });
+        if let Some(limit) = opts.get("limit").and_then(|s| s.parse::<i64>().ok()) {
+            req["limit"] = json!(limit);
+        }
+        if let Some(b) = opts
+            .get("include_subdomains")
+            .as_deref()
+            .and_then(parse_bool)
+        {
+            req["includeSubdomains"] = json!(b);
+        }
+        if let Some(search) = opts.get("search") {
+            req["search"] = json!(search);
+        }
+
+        let submitted = self.do_post("/map", &req)?;
+        let id = submitted
+            .get("id")
+            .or_else(|| submitted.get("job_id"))
+            .and_then(|v| v.as_str())
+            .ok_or("Anakin map response has no job id")?
+            .to_owned();
+        let resp = self.poll_job(&format!("/map/{id}"), submitted)?;
+        if resp.get("status").and_then(|v| v.as_str()) == Some("failed") {
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Anakin map job {id} failed: {err}"));
+        }
+
+        self.src_rows.clear();
+        for (key, external) in [("links", false), ("externalLinks", true)] {
+            let links = resp.get(key).and_then(|v| v.as_array());
+            for link in links.into_iter().flatten().filter_map(|v| v.as_str()) {
+                self.src_rows.push(json!({
+                    "url": url,
+                    "link": link,
+                    "is_external": external,
+                    "job_id": id,
+                }));
+            }
+        }
+        self.src_idx = 0;
+
+        stats::inc_stats(FDW_NAME, stats::Metric::RowsIn, self.src_rows.len() as i64);
+        Ok(())
+    }
+
     fn begin_scan_for_object(&mut self, ctx: &Context) -> FdwResult {
         match self.object.as_str() {
+            "scrape" => self.fetch_scrape_results(ctx),
+            "map" => self.fetch_map_results(ctx),
             "search" => {
                 self.prompt = Self::require_eq_qual(ctx, "prompt", "anakin_search")?;
                 self.fetch_search_results(ctx)
@@ -277,13 +446,15 @@ impl AnakinFdw {
             "ai_visibility_sources" => self.fetch_ai_visibility_sources(),
             other => Err(format!(
                 "anakin_fdw: unknown 'object' table option '{other}' - expected one of \
-                 'search', 'wire_catalog', 'wire_discover', 'ai_visibility_sources'"
+                 'scrape', 'map', 'search', 'wire_catalog', 'wire_discover', \
+                 'ai_visibility_sources'"
             )),
         }
     }
 
     fn src_to_cell(&self, src_row: &JsonValue, tgt_col: &Column) -> Result<Option<Cell>, FdwError> {
         match self.object.as_str() {
+            "scrape" | "map" => json_to_cell(src_row, tgt_col),
             "search" => self.search_cell(src_row, tgt_col),
             "wire_catalog" => self.wire_catalog_cell(src_row, tgt_col),
             "wire_discover" => self.wire_discover_cell(src_row, tgt_col),
@@ -306,9 +477,7 @@ impl AnakinFdw {
             "date" => str_field(src_row, "date"),
             "last_updated" => str_field(src_row, "last_updated"),
             _ => {
-                return Err(format!(
-                    "column '{name}' is not supported by anakin_search"
-                ));
+                return Err(format!("column '{name}' is not supported by anakin_search"));
             }
         };
         Ok(cell)
@@ -391,6 +560,91 @@ fn ai_visibility_source_cell(
             return Err(format!(
                 "column '{name}' is not supported by anakin_ai_visibility_sources"
             ));
+        }
+    };
+    Ok(cell)
+}
+
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "t" | "yes" | "on" | "1" => Some(true),
+        "false" | "f" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+// string values of an `=` qual, including `in (...)` / `= any(...)` lists
+fn qual_strings(value: &Value) -> Vec<String> {
+    let one = |c: &Cell| match c {
+        Cell::String(s) => Some(s.clone()),
+        _ => None,
+    };
+    match value {
+        Value::Cell(c) => one(c).into_iter().collect(),
+        Value::Array(cells) => cells.iter().filter_map(one).collect(),
+    }
+}
+
+// API responses are camelCase, columns are snake_case
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn snake_case_keys(src: &JsonValue) -> JsonMap<String, JsonValue> {
+    let mut out = JsonMap::new();
+    if let Some(obj) = src.as_object() {
+        for (k, v) in obj {
+            out.insert(camel_to_snake(k), v.clone());
+        }
+    }
+    out
+}
+
+// convert a column of a normalized row (anakin_scrape, anakin_map) into a
+// cell of the column's declared type, so users can pick text/jsonb/etc.
+fn json_to_cell(src_row: &JsonValue, tgt_col: &Column) -> Result<Option<Cell>, FdwError> {
+    let src = match src_row.get(tgt_col.name()) {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(None),
+    };
+    let cell = match tgt_col.type_oid() {
+        TypeOid::Bool => src.as_bool().map(Cell::Bool),
+        TypeOid::I16 => src.as_i64().map(|v| Cell::I16(v as i16)),
+        TypeOid::I32 => src.as_i64().map(|v| Cell::I32(v as i32)),
+        TypeOid::I64 => src.as_i64().map(Cell::I64),
+        TypeOid::F32 => src.as_f64().map(|v| Cell::F32(v as f32)),
+        TypeOid::F64 => src.as_f64().map(Cell::F64),
+        TypeOid::Numeric => src.as_f64().map(Cell::Numeric),
+        TypeOid::String => Some(Cell::String(match src.as_str() {
+            Some(s) => s.to_owned(),
+            None => src.to_string(),
+        })),
+        TypeOid::Timestamp => src
+            .as_str()
+            .and_then(|s| time::parse_from_rfc3339(s).ok())
+            .map(Cell::Timestamp),
+        TypeOid::Timestamptz => src
+            .as_str()
+            .and_then(|s| time::parse_from_rfc3339(s).ok())
+            .map(Cell::Timestamptz),
+        TypeOid::Json => Some(Cell::Json(src.to_string())),
+        _ => {
+            return Err(format!(
+                "column '{}' has an unsupported type; use text, bigint, boolean, \
+                 timestamptz or jsonb",
+                tgt_col.name()
+            ))
         }
     };
     Ok(cell)
@@ -479,24 +733,37 @@ impl Guest for AnakinFdw {
         // `api_key` server option (fine for local/dev only, it lands in
         // pg_catalog in plaintext) or store it in Supabase Vault and
         // reference it by `api_key_id`, same pattern orb_fdw/hubspot_fdw use.
-        let api_key = match opts.get("api_key") {
-            Some(key) => key,
-            None => {
-                let key_id = opts.require("api_key_id")?;
-                utils::get_vault_secret(&key_id).unwrap_or_default()
-            }
+        //
+        // The key is optional: anakin_scrape works without one on the keyless
+        // free tier. Every other table returns the API's own 401 message.
+        let api_key = match (
+            opts.get("api_key"),
+            opts.get("api_key_id"),
+            opts.get("api_key_name"),
+        ) {
+            (Some(key), _, _) => key,
+            (None, Some(key_id), _) => utils::get_vault_secret(&key_id)
+                .ok_or(format!("Vault secret '{key_id}' (api_key_id) not found"))?,
+            (None, None, Some(name)) => utils::get_vault_secret_by_name(&name)
+                .ok_or(format!("Vault secret '{name}' (api_key_name) not found"))?,
+            (None, None, None) => String::new(),
         };
-        if api_key.is_empty() {
-            return Err(
-                "Anakin API key not found: set the 'api_key' server option or \
-                 'api_key_id' pointing to a Supabase Vault secret"
-                    .to_owned(),
-            );
-        }
 
+        this.base_url = this.base_url.trim_end_matches('/').to_owned();
         this.headers
             .push(("content-type".to_owned(), "application/json".to_string()));
-        this.headers.push(("x-api-key".to_owned(), api_key));
+        this.headers
+            .push(("user-agent".to_owned(), USER_AGENT.to_owned()));
+        if !api_key.trim().is_empty() {
+            this.headers
+                .push(("x-api-key".to_owned(), api_key.trim().to_owned()));
+        }
+
+        this.poll_timeout_secs = opts
+            .get("poll_timeout_secs")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_POLL_TIMEOUT_SECS);
 
         stats::inc_stats(FDW_NAME, stats::Metric::CreateTimes, 1);
 
@@ -514,7 +781,7 @@ impl Guest for AnakinFdw {
         let this = Self::this_mut();
 
         if this.src_idx >= this.src_rows.len() {
-            // no more buffered rows - every one of the four objects is a
+            // no more buffered rows - every object is a
             // single-shot call, there is no cursor/page to follow up on, so
             // the scan just ends here.
             return Ok(None);
@@ -532,13 +799,12 @@ impl Guest for AnakinFdw {
     }
 
     fn re_scan(ctx: &Context) -> FdwResult {
-        // anakin_search rewinds the cursor without spending another credited
-        // call (same prompt, same buffered results). The other three objects
-        // are free listing/lookup calls, so re-fetching on a re-scan is fine
-        // and keeps their data fresh within the same statement; only search
-        // spends credits per call, hence the special case.
+        // anakin_scrape, anakin_map and anakin_search rewind the cursor
+        // without spending another credited call (same quals, same buffered
+        // results). The other three objects are free listing/lookup calls,
+        // so re-fetching on a re-scan is fine.
         let this = Self::this_mut();
-        if this.object == "search" {
+        if matches!(this.object.as_str(), "scrape" | "map" | "search") {
             this.src_idx = 0;
             return Ok(());
         }
@@ -585,6 +851,22 @@ impl Guest for AnakinFdw {
         // option) - the table names here are the `anakin_`-prefixed names
         // this FDW already documents, not the bare object slug Paddle uses.
         let tables: Vec<(&str, &str, &str, &str)> = vec![
+            (
+                "anakin_scrape",
+                "scrape",
+                "url text, final_url text, status text, status_code bigint, markdown text, \
+                 html text, cleaned_html text, links jsonb, images jsonb, summary text, \
+                 generated_json jsonb, country text, use_browser boolean, cached boolean, \
+                 duration_ms bigint, created_at timestamptz, completed_at timestamptz, \
+                 error text, id text, attrs jsonb",
+                "url",
+            ),
+            (
+                "anakin_map",
+                "map",
+                "url text, link text, is_external boolean, job_id text",
+                "link",
+            ),
             (
                 "anakin_search",
                 "search",

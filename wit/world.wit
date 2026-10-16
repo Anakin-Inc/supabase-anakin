@@ -1,4 +1,4 @@
-package anakin:anakin-fdw@0.2.0;
+package anakin:anakin-fdw@0.3.0;
 
 world anakin {
     import supabase:wrappers/http@0.2.0;

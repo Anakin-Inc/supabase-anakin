@@ -1,0 +1,65 @@
+name: Release Wasm FDW
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with the wasm32 target
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install cargo-component
+        run: cargo install cargo-component --locked --version 0.21.1
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v${crate_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate_version}"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo component build --release --target wasm32-unknown-unknown
+
+      - name: Package
+        run: |
+          cp target/wasm32-unknown-unknown/release/anakin_fdw.wasm .
+          sha256sum anakin_fdw.wasm | cut -d' ' -f1 > checksum.txt
+          echo "checksum: $(cat checksum.txt)"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          checksum=$(cat checksum.txt)
+          {
+            echo "Anakin Wasm FDW ${GITHUB_REF_NAME} for Supabase Wrappers."
+            echo
+            echo '```sql'
+            echo "create server anakin_server"
+            echo "  foreign data wrapper wasm_wrapper"
+            echo "  options ("
+            echo "    fdw_package_url 'https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/anakin_fdw.wasm',"
+            echo "    fdw_package_name 'anakin:anakin-fdw',"
+            echo "    fdw_package_version '${version}',"
+            echo "    fdw_package_checksum '${checksum}',"
+            echo "    api_key_id '<vault secret id>'"
+            echo "  );"
+            echo '```'
+          } > notes.md
+          gh release create "${GITHUB_REF_NAME}" anakin_fdw.wasm checksum.txt \
+            --title "${GITHUB_REF_NAME}" --notes-file notes.md
